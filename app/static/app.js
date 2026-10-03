@@ -377,13 +377,46 @@ async function renderBills() {
 }
 
 function ccSummary(bills) {
-  const cards = bills.filter((b) => b.active && b.is_credit_card && b.credit_limit && b.balance != null);
+  const cards = bills.filter((b) => b.active && b.is_credit_card);
   if (!cards.length) return "";
-  const bal = cards.reduce((a, b) => a + b.balance, 0);
-  const lim = cards.reduce((a, b) => a + b.credit_limit, 0);
-  const over = cards.filter((b) => b.util_status === "over").length;
-  return `<p class="cc-summary">Credit cards: ${money(bal)} of ${money(lim)} used (${pct((bal / lim) * 100)} overall)${
-    over ? ` · <span style="color:var(--late);font-weight:700">${over} card${over > 1 ? "s" : ""} over 30%</span>` : " · all within 30%"}</p>`;
+  const withLimit = cards.filter((b) => b.credit_limit);
+  const limit = withLimit.reduce((a, b) => a + b.credit_limit, 0);
+  const used = cards.reduce((a, b) => a + (b.balance || 0), 0);
+  const noBalance = withLimit.filter((b) => b.balance == null);
+  const noLimit = cards.filter((b) => !b.credit_limit);
+  // Amount to pay down so every card is at or under 30% of its own limit.
+  const overCards = withLimit
+    .filter((b) => b.util_status === "over")
+    .map((b) => ({ name: b.creditor, amount: b.balance - b.util_threshold }))
+    .sort((a, b) => b.amount - a.amount);
+  const toFix = overCards.reduce((a, c) => a + c.amount, 0);
+  const util = limit ? (used / limit) * 100 : null;
+  const over = util != null && used > limit * 0.3;
+
+  const notes = [];
+  if (noBalance.length) notes.push(`No balance entered for ${noBalance.map((b) => esc(b.creditor)).join(", ")} (counted as $0).`);
+  if (noLimit.length) notes.push(`No credit limit for ${noLimit.map((b) => esc(b.creditor)).join(", ")} (left out of the limit total).`);
+
+  return `<section class="panel cc-panel" aria-label="Credit card totals">
+    <div class="cc-stats">
+      <div><span class="label">Total credit limit</span><span class="value">${money(limit)}</span></div>
+      <div><span class="label">Total credit used</span><span class="value">${money(used)}</span></div>
+      <div><span class="label">To bring all cards to 30%</span>
+        <span class="value ${toFix > 0 ? "neg" : "pos"}">${toFix > 0 ? money(toFix) : "$0.00"}</span></div>
+    </div>
+    ${limit ? `<div class="util ${over ? "is-over" : "is-under"}">
+      <div class="util-meter big" role="img" aria-label="${pct(util)} of total credit used; target is 30%">
+        <span class="fill" style="width:${Math.min(100, util)}%"></span><span class="mark" title="30% of total limit"></span>
+      </div>
+      <div class="util-text">
+        <span class="tag ${over ? "late" : "paid"}">${over ? "Over" : "Within"} 30% overall · ${pct(util)}</span>
+        <span class="muted">30% of your total limit is ${money(limit * 0.3)}</span>
+      </div>
+    </div>` : `<p class="muted" style="margin:0">Add credit limits to your cards to see utilization.</p>`}
+    ${overCards.length ? `<p class="cc-breakdown">Pay down ${overCards.map((c) => `<strong>${esc(c.name)}</strong> ${money(c.amount)}`).join(", ")}.</p>`
+      : withLimit.length && !noBalance.length ? `<p class="cc-breakdown">Every card is at or under 30% of its limit.</p>` : ""}
+    ${notes.length ? `<p class="cc-note">${notes.join(" ")}</p>` : ""}
+  </section>`;
 }
 
 function billForm(b = {}) {
