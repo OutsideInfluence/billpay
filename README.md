@@ -39,6 +39,22 @@ which builds a new image. Compose Up on Unraid pulls it.
   a checklist to mark bills paid, and a list of anything still unpaid from the
   previous 60 days. Use ‹ › to look ahead or back.
 
+## Credit cards and categories
+
+Manage categories under **Settings → Bill categories**. A category is either
+*Standard* or *Credit card*. Bills in a credit card category get:
+
+- **Credit limit** and **current balance**, editable any time with
+  *Update balance* on the Bills page, in the bill's edit form, or when you mark
+  a payment ("Balance after this payment").
+- **30% utilization**: 30% of the limit is calculated automatically, and the bill
+  shows *Over 30%* (red) or *Within 30%* (green) with the percentage used, on
+  both the Bills page and the dashboard.
+
+Deleting a category keeps its bills; they're just left without a category.
+Upgrading from an earlier version converts existing free-text categories
+automatically. Any category with "credit" in its name becomes a credit card category.
+
 ## Data & backups
 
 Data lives in a SQLite file in the `billpay-data` Docker volume.
