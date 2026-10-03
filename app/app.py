@@ -90,7 +90,19 @@ CREATE TABLE IF NOT EXISTS login_failures (
 );
 CREATE INDEX IF NOT EXISTS idx_fail_user ON login_failures(username, at);
 CREATE INDEX IF NOT EXISTS idx_fail_ip ON login_failures(ip, at);
+CREATE TABLE IF NOT EXISTS categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    kind TEXT NOT NULL DEFAULT 'standard' CHECK (kind IN ('standard', 'credit_card'))
+);
 """
+
+DEFAULT_CATEGORIES = [
+    ("Housing", "standard"), ("Utilities", "standard"), ("Insurance", "standard"),
+    ("Loans", "standard"), ("Credit cards", "credit_card"), ("Subscriptions", "standard"),
+    ("Phone & internet", "standard"), ("Medical", "standard"), ("Other", "standard"),
+]
+UTILIZATION_TARGET = 0.30
 
 DEFAULT_SETTINGS = {
     "person1": "Me",
@@ -123,8 +135,37 @@ def init_db():
     conn.execute("PRAGMA journal_mode = WAL")
     for k, v in DEFAULT_SETTINGS.items():
         conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, v))
+    migrate(conn)
     conn.commit()
     conn.close()
+
+
+def migrate(conn):
+    """Bring databases from earlier versions up to date. Safe to run every start."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(bills)")}
+    for col, ddl in (
+        ("category_id", "INTEGER REFERENCES categories(id) ON DELETE SET NULL"),
+        ("credit_limit", "REAL"),
+        ("balance", "REAL"),
+        ("balance_updated", "TEXT"),
+    ):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE bills ADD COLUMN {col} {ddl}")
+
+    if conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0] == 0:
+        conn.executemany("INSERT OR IGNORE INTO categories (name, kind) VALUES (?, ?)", DEFAULT_CATEGORIES)
+
+    # Earlier versions stored the category as free text on each bill.
+    for bid, text in conn.execute(
+        "SELECT id, category FROM bills WHERE category_id IS NULL AND TRIM(COALESCE(category, '')) <> ''"
+    ).fetchall():
+        name = text.strip()
+        row = conn.execute("SELECT id FROM categories WHERE name = ?", (name,)).fetchone()
+        if not row:
+            kind = "credit_card" if "credit" in name.lower() else "standard"
+            conn.execute("INSERT INTO categories (name, kind) VALUES (?, ?)", (name, kind))
+            row = conn.execute("SELECT id FROM categories WHERE name = ?", (name,)).fetchone()
+        conn.execute("UPDATE bills SET category_id = ?, category = '' WHERE id = ?", (row[0], bid))
 
 
 init_db()
@@ -382,8 +423,36 @@ def occurrences(bill, start, end):
     return out
 
 
+BILL_SELECT = """
+    SELECT b.*, c.name AS category_name, c.kind AS category_kind
+    FROM bills b LEFT JOIN categories c ON c.id = b.category_id
+"""
+
+
+def enrich_bill(b):
+    """Add the credit-card figures the screens need."""
+    b = dict(b)
+    b["autopay"] = bool(b["autopay"])
+    b["active"] = bool(b["active"])
+    b.pop("category", None)  # legacy free-text column
+    cc = b.get("category_kind") == "credit_card"
+    b["is_credit_card"] = cc
+    b["util_threshold"] = b["utilization"] = b["util_status"] = None
+    if cc and b.get("credit_limit"):
+        b["util_threshold"] = round(b["credit_limit"] * UTILIZATION_TARGET, 2)
+        if b.get("balance") is not None:
+            b["utilization"] = round(b["balance"] / b["credit_limit"] * 100, 1)
+            b["util_status"] = "over" if b["balance"] > b["util_threshold"] else "under"
+    return b
+
+
+def get_bill(bid):
+    r = db().execute(BILL_SELECT + " WHERE b.id = ?", (bid,)).fetchone()
+    return enrich_bill(r) if r else None
+
+
 def bill_instances(start, end):
-    bills = rows(db().execute("SELECT * FROM bills WHERE active = 1"))
+    bills = [enrich_bill(r) for r in db().execute(BILL_SELECT + " WHERE b.active = 1")]
     pays = {
         (p["bill_id"], p["due_date"]): p
         for p in rows(
@@ -397,7 +466,7 @@ def bill_instances(start, end):
     for b in bills:
         for dd in occurrences(b, start, end):
             p = pays.get((b["id"], dd.isoformat()))
-            out.append({**b, "autopay": bool(b["autopay"]), "due_date": dd.isoformat(), "payment": p})
+            out.append({**b, "due_date": dd.isoformat(), "payment": p})
     out.sort(key=lambda x: (x["due_date"], x["creditor"].lower()))
     return out
 
@@ -436,8 +505,20 @@ def settings_put():
     return jsonify(get_settings())
 
 
-BILL_FIELDS = ["creditor", "description", "amount", "due_day", "website", "category",
-               "account_hint", "autopay", "notes", "active", "start_date"]
+BILL_FIELDS = ["creditor", "description", "amount", "due_day", "website", "category_id",
+               "account_hint", "autopay", "notes", "active", "start_date", "credit_limit", "balance"]
+
+
+def money_or_none(v, label):
+    if v is None or str(v).strip() == "":
+        return None
+    try:
+        n = round(float(str(v).replace(",", "").replace("$", "")), 2)
+    except ValueError:
+        raise ValueError(f"{label} must be a number.")
+    if n < 0:
+        raise ValueError(f"{label} can't be negative.")
+    return n
 
 
 def clean_bill(data, partial=False):
@@ -471,6 +552,24 @@ def clean_bill(data, partial=False):
     if "account_hint" in b:
         # Only ever keep the last 4 characters of an account number.
         b["account_hint"] = str(b["account_hint"]).strip()[-4:]
+    if "category_id" in b:
+        cid = b["category_id"]
+        if cid in (None, "", 0, "0"):
+            b["category_id"] = None
+        else:
+            try:
+                b["category_id"] = int(cid)
+            except (TypeError, ValueError):
+                raise ValueError("Choose a category from the list.")
+            if not db().execute("SELECT 1 FROM categories WHERE id=?", (b["category_id"],)).fetchone():
+                raise ValueError("That category no longer exists.")
+    if "credit_limit" in b:
+        b["credit_limit"] = money_or_none(b["credit_limit"], "Credit limit")
+        if b["credit_limit"] == 0:
+            raise ValueError("Credit limit must be more than zero.")
+    if "balance" in b:
+        b["balance"] = money_or_none(b["balance"], "Balance")
+        b["balance_updated"] = date.today().isoformat() if b["balance"] is not None else None
     if not partial and not b.get("start_date"):
         b["start_date"] = date.today().replace(day=1).isoformat()
     return b
@@ -478,7 +577,8 @@ def clean_bill(data, partial=False):
 
 @app.get("/api/bills")
 def bills_list():
-    return jsonify(rows(db().execute("SELECT * FROM bills ORDER BY active DESC, due_day, creditor")))
+    return jsonify([enrich_bill(r) for r in db().execute(
+        BILL_SELECT + " ORDER BY b.active DESC, b.due_day, b.creditor")])
 
 
 @app.post("/api/bills")
@@ -490,21 +590,106 @@ def bills_create():
     cols = ",".join(b)
     cur = db().execute(f"INSERT INTO bills ({cols}) VALUES ({','.join('?' * len(b))})", list(b.values()))
     db().commit()
-    return jsonify(dict(db().execute("SELECT * FROM bills WHERE id=?", (cur.lastrowid,)).fetchone())), 201
+    return jsonify(get_bill(cur.lastrowid)), 201
 
 
 @app.put("/api/bills/<int:bid>")
 def bills_update(bid):
+    data = request.get_json(force=True) or {}
+    old = get_bill(bid)
+    if not old:
+        return bad("Bill not found.", 404)
     try:
-        b = clean_bill(request.get_json(force=True) or {}, partial=True)
+        b = clean_bill(data, partial=True)
     except ValueError as e:
         return bad(str(e))
+    # Only stamp a new "updated" date when the balance actually changed.
+    if "balance" in b and b["balance"] == old.get("balance"):
+        b.pop("balance")
+        b.pop("balance_updated", None)
     if b:
         sets = ",".join(f"{k}=?" for k in b)
         db().execute(f"UPDATE bills SET {sets} WHERE id=?", [*b.values(), bid])
         db().commit()
-    r = db().execute("SELECT * FROM bills WHERE id=?", (bid,)).fetchone()
-    return jsonify(dict(r)) if r else bad("Bill not found.", 404)
+    return jsonify(get_bill(bid))
+
+
+@app.put("/api/bills/<int:bid>/balance")
+def bills_set_balance(bid):
+    """Quick update of a credit card's balance and/or limit."""
+    data = request.get_json(force=True) or {}
+    if not get_bill(bid):
+        return bad("Bill not found.", 404)
+    try:
+        updates = {}
+        if "balance" in data:
+            updates["balance"] = money_or_none(data["balance"], "Balance")
+            updates["balance_updated"] = date.today().isoformat() if updates["balance"] is not None else None
+        if "credit_limit" in data:
+            updates["credit_limit"] = money_or_none(data["credit_limit"], "Credit limit")
+            if updates["credit_limit"] == 0:
+                raise ValueError("Credit limit must be more than zero.")
+    except ValueError as e:
+        return bad(str(e))
+    if updates:
+        sets = ",".join(f"{k}=?" for k in updates)
+        db().execute(f"UPDATE bills SET {sets} WHERE id=?", [*updates.values(), bid])
+        db().commit()
+    return jsonify(get_bill(bid))
+
+
+# ---------- categories ----------
+def clean_category(data):
+    name = str(data.get("name", "")).strip()[:40]
+    if not name:
+        raise ValueError("Enter a category name.")
+    kind = data.get("kind", "standard")
+    if kind not in ("standard", "credit_card"):
+        raise ValueError("Category type must be standard or credit card.")
+    return name, kind
+
+
+@app.get("/api/categories")
+def categories_list():
+    return jsonify(rows(db().execute("""
+        SELECT c.id, c.name, c.kind, COUNT(b.id) AS bill_count
+        FROM categories c LEFT JOIN bills b ON b.category_id = c.id
+        GROUP BY c.id ORDER BY c.name COLLATE NOCASE""")))
+
+
+@app.post("/api/categories")
+def categories_create():
+    try:
+        name, kind = clean_category(request.get_json(force=True) or {})
+        cur = db().execute("INSERT INTO categories (name, kind) VALUES (?, ?)", (name, kind))
+        db().commit()
+    except ValueError as e:
+        return bad(str(e))
+    except sqlite3.IntegrityError:
+        return bad("A category with that name already exists.")
+    return jsonify({"id": cur.lastrowid, "name": name, "kind": kind, "bill_count": 0}), 201
+
+
+@app.put("/api/categories/<int:cid>")
+def categories_update(cid):
+    try:
+        name, kind = clean_category(request.get_json(force=True) or {})
+        db().execute("UPDATE categories SET name=?, kind=? WHERE id=?", (name, kind, cid))
+        db().commit()
+    except ValueError as e:
+        return bad(str(e))
+    except sqlite3.IntegrityError:
+        return bad("A category with that name already exists.")
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/categories/<int:cid>")
+def categories_delete(cid):
+    # Bills in this category stay, with no category. Their balance and limit are kept.
+    db().execute("UPDATE bills SET category_id = NULL WHERE category_id = ?", (cid,))
+    db().execute("DELETE FROM categories WHERE id = ?", (cid,))
+    db().commit()
+    return "", 204
 
 
 @app.delete("/api/bills/<int:bid>")
@@ -586,6 +771,12 @@ def payments_create():
         "INSERT OR REPLACE INTO payments (bill_id, due_date, paid_on, amount) VALUES (?,?,?,?)",
         (bill_id, due, paid_on, amount),
     )
+    if str(data.get("balance", "")).strip() != "":
+        try:
+            bal = money_or_none(data["balance"], "Balance")
+        except ValueError as e:
+            return bad(str(e))
+        db().execute("UPDATE bills SET balance=?, balance_updated=? WHERE id=?", (bal, date.today().isoformat(), bill_id))
     db().commit()
     return jsonify({"ok": True}), 201
 
