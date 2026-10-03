@@ -1,0 +1,9 @@
+.git
+.github
+deploy
+data
+*.db
+*.db-*
+secret_key
+.env
+README.md
