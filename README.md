@@ -51,6 +51,10 @@ Manage categories under **Settings → Bill categories**. A category is either
   shows *Over 30%* (red) or *Within 30%* (green) with the percentage used, on
   both the Bills page and the dashboard.
 
+The top of the Bills page totals all active credit cards: total limit, total
+used, a meter with the 30% mark, and the amount to pay down so every card is at
+or under 30% of its own limit (with a per-card breakdown).
+
 Deleting a category keeps its bills; they're just left without a category.
 Upgrading from an earlier version converts existing free-text categories
 automatically. Any category with "credit" in its name becomes a credit card category.
