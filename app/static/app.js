@@ -76,6 +76,7 @@ function showAuth(mode, notice = "") {
   if (modal.open) modal.close();
   state.user = null;
   state.settings = null;
+  state.categories = null;
   shellEl.hidden = true;
   authEl.hidden = false;
   const setup = mode === "setup";
@@ -155,6 +156,7 @@ async function route() {
     else a.removeAttribute("aria-current");
   });
   if (!state.settings) state.settings = await api("/api/settings");
+  if (!state.categories) await loadCategories();
   try {
     await fn();
   } catch (err) {
@@ -164,6 +166,57 @@ async function route() {
 window.addEventListener("hashchange", route);
 
 // ---------- dashboard ----------
+// ---------- categories & credit card helpers ----------
+async function loadCategories() {
+  state.categories = await api("/api/categories");
+  return state.categories;
+}
+const categoryById = (id) => (state.categories || []).find((c) => c.id === Number(id));
+const pct = (n) => `${Number(n).toFixed(n >= 10 || n === 0 ? 0 : 1)}%`;
+
+function utilTag(b) {
+  if (!b.is_credit_card || !b.util_status) return "";
+  return b.util_status === "over"
+    ? `<span class="tag late" title="${pct(b.utilization)} of limit used">Over 30% · ${pct(b.utilization)}</span>`
+    : `<span class="tag paid" title="${pct(b.utilization)} of limit used">Within 30% · ${pct(b.utilization)}</span>`;
+}
+
+// Full credit card readout: meter with a 30% mark, figures and status.
+function utilBlock(b, { compact = false } = {}) {
+  if (!b.is_credit_card) return "";
+  if (!b.credit_limit) {
+    return `<div class="util util-empty">Add a credit limit to track utilization.</div>`;
+  }
+  const threshold = b.util_threshold;
+  if (b.balance == null) {
+    return `<div class="util util-empty">Limit ${money(b.credit_limit)} · 30% is ${money(threshold)}. Add the current balance.</div>`;
+  }
+  const over = b.util_status === "over";
+  const width = Math.min(100, Math.max(0, b.utilization));
+  return `<div class="util ${over ? "is-over" : "is-under"}">
+    <div class="util-meter" role="img" aria-label="${pct(b.utilization)} of credit limit used; target is 30%">
+      <span class="fill" style="width:${width}%"></span><span class="mark" title="30% of limit"></span>
+    </div>
+    <div class="util-text">
+      ${utilTag(b)}
+      <span>${money(b.balance)} of ${money(b.credit_limit)}</span>
+      ${compact ? "" : `<span class="muted">30% is ${money(threshold)} · ${over ? `${money(b.balance - threshold)} over` : `${money(threshold - b.balance)} to spare`}</span>`}
+      ${b.balance_updated ? `<span class="muted">Updated ${dLong(b.balance_updated)}</span>` : ""}
+    </div>
+  </div>`;
+}
+
+// Live preview used inside forms while typing a limit or balance.
+function utilPreview(limit, balance) {
+  limit = parseFloat(limit); balance = parseFloat(balance);
+  if (!(limit > 0)) return "Enter the credit limit to see the 30% mark.";
+  const t = Math.round(limit * 30) / 100;
+  if (isNaN(balance)) return `30% of the limit is <strong>${money(t)}</strong>.`;
+  const u = (balance / limit) * 100;
+  return `30% of the limit is <strong>${money(t)}</strong>. This balance uses <strong>${pct(u)}</strong>, ${
+    balance > t ? `<span style="color:var(--late);font-weight:700">${money(balance - t)} over</span>` : `<span style="color:var(--paid);font-weight:700">${money(t - balance)} under</span>`}.`;
+}
+
 function billStatus(b, today) {
   if (b.payment) return { cls: "paid", label: `Paid ${dLong(b.payment.paid_on)}` };
   if (b.autopay) return { cls: "auto", label: b.due_date < today ? "Autopaid" : "Autopay" };
@@ -191,6 +244,7 @@ function billRow(b, today) {
           <span class="tag ${st.cls}">${st.label}</span>
           ${b.description ? `<span>${esc(b.description)}</span>` : ""}
           ${b.account_hint ? `<span>••${esc(b.account_hint)}</span>` : ""}
+          ${utilTag(b)}
         </div>
       </div>
       <div class="right">
@@ -298,6 +352,7 @@ async function renderBills() {
       <div><h1>Bills</h1><p>${bills.filter((b) => b.active).length} active · ${money(monthly)} per month</p></div>
       <button class="btn primary" data-add-bill>Add bill</button>
     </div>
+    ${ccSummary(bills)}
     <div class="filters"><div class="seg" role="group" aria-label="Filter bills">
       ${["active", "inactive", "all"].map((f) => `<button data-filter="${f}" aria-pressed="${state.billFilter === f}">${f[0].toUpperCase() + f.slice(1)}</button>`).join("")}
     </div></div>
@@ -306,18 +361,29 @@ async function renderBills() {
         <thead><tr><th>Creditor</th><th>Due</th><th data-hide-mobile>Category</th><th class="num">Amount</th><th></th></tr></thead>
         <tbody>${shown.map((b) => `
           <tr class="${b.active ? "" : "inactive"}">
-            <td><strong>${esc(b.creditor)}</strong>${b.description ? `<div class="muted" style="font-size:.85rem">${esc(b.description)}</div>` : ""}</td>
+            <td class="creditor-cell"><strong>${esc(b.creditor)}</strong>${b.description ? `<div class="muted" style="font-size:.85rem">${esc(b.description)}</div>` : ""}${utilBlock(b, { compact: true })}</td>
             <td class="num" style="text-align:inherit">${ordinal(b.due_day)} ${b.autopay ? '<span class="tag auto">Autopay</span>' : ""}${b.active ? "" : ' <span class="tag">Inactive</span>'}</td>
-            <td data-hide-mobile>${esc(b.category) || '<span class="muted">—</span>'}</td>
+            <td data-hide-mobile>${b.category_name ? esc(b.category_name) : '<span class="muted">—</span>'}</td>
             <td class="num money">${money(b.amount)}</td>
             <td class="actions-cell" style="text-align:right;white-space:nowrap">
               ${b.website ? `<a class="btn small" href="${esc(b.website)}" target="_blank" rel="noopener noreferrer">Pay online</a>` : ""}
+              ${b.is_credit_card ? `<button class="btn small" data-balance-bill="${b.id}">Update balance</button>` : ""}
               <button class="btn small" data-edit-bill="${b.id}">Edit</button>
             </td>
           </tr>`).join("")}</tbody></table></div>`
         : `<div class="empty"><p>${bills.length ? "No bills match this filter." : "Add your first monthly bill to start planning each pay period."}</p>${bills.length ? "" : '<button class="btn primary" data-add-bill>Add bill</button>'}</div>`}
     </div>`;
   state.billsCache = bills;
+}
+
+function ccSummary(bills) {
+  const cards = bills.filter((b) => b.active && b.is_credit_card && b.credit_limit && b.balance != null);
+  if (!cards.length) return "";
+  const bal = cards.reduce((a, b) => a + b.balance, 0);
+  const lim = cards.reduce((a, b) => a + b.credit_limit, 0);
+  const over = cards.filter((b) => b.util_status === "over").length;
+  return `<p class="cc-summary">Credit cards: ${money(bal)} of ${money(lim)} used (${pct((bal / lim) * 100)} overall)${
+    over ? ` · <span style="color:var(--late);font-weight:700">${over} card${over > 1 ? "s" : ""} over 30%</span>` : " · all within 30%"}</p>`;
 }
 
 function billForm(b = {}) {
@@ -328,8 +394,20 @@ function billForm(b = {}) {
       <span class="hint">Use 31 for the last day of the month</span></label>
     <label class="field full">Payment website<input name="website" type="url" inputmode="url" value="${esc(b.website)}" placeholder="https://"></label>
     <label class="field">Description<input name="description" value="${esc(b.description)}" placeholder="e.g. Car loan"></label>
-    <label class="field">Category<input name="category" list="cats" value="${esc(b.category)}" placeholder="e.g. Utilities">
-      <datalist id="cats">${["Housing", "Utilities", "Insurance", "Loans", "Credit cards", "Subscriptions", "Phone & internet", "Medical", "Other"].map((c) => `<option value="${c}">`).join("")}</datalist></label>
+    <label class="field">Category
+      <select name="category_id" data-category-select>
+        <option value="">No category</option>
+        ${(state.categories || []).map((c) => `<option value="${c.id}" ${c.id === b.category_id ? "selected" : ""}>${esc(c.name)}${c.kind === "credit_card" && !/credit/i.test(c.name) ? " (credit card)" : ""}</option>`).join("")}
+      </select>
+      <span class="hint"><a href="#/settings" data-close>Manage categories</a></span></label>
+    <fieldset class="cc-fields full" data-cc-fields ${b.is_credit_card || categoryById(b.category_id)?.kind === "credit_card" ? "" : "hidden"}>
+      <legend>Credit card</legend>
+      <div class="form-grid">
+        <label class="field">Credit limit<input name="credit_limit" type="number" step="0.01" min="0" inputmode="decimal" value="${b.credit_limit ?? ""}" data-util-input></label>
+        <label class="field">Current balance<input name="balance" type="number" step="0.01" min="0" inputmode="decimal" value="${b.balance ?? ""}" data-util-input></label>
+        <p class="util-preview full" data-util-preview>${utilPreview(b.credit_limit, b.balance)}</p>
+      </div>
+    </fieldset>
     <label class="field">Account (last 4 only)<input name="account_hint" maxlength="4" inputmode="numeric" value="${esc(b.account_hint)}">
       <span class="hint">Never store full account numbers or passwords</span></label>
     <label class="field">First due month<input name="start_date" type="month" value="${(b.start_date || todayIso()).slice(0, 7)}"></label>
@@ -344,6 +422,8 @@ function readBill(fd, isEdit) {
   o.autopay = fd.has("autopay");
   if (isEdit) o.active = fd.has("active");
   o.start_date = o.start_date ? `${o.start_date}-01` : undefined;
+  // Only send card figures when the chosen category is a credit card; otherwise keep what's stored.
+  if (categoryById(o.category_id)?.kind !== "credit_card") { delete o.credit_limit; delete o.balance; }
   return o;
 }
 
@@ -370,6 +450,23 @@ function openBill(b) {
   });
 }
 
+function openUpdateBalance(b) {
+  openModal({
+    title: `${b.creditor} balance`,
+    body: `<div class="form-grid">
+        <label class="field">Current balance<input name="balance" type="number" step="0.01" min="0" inputmode="decimal" value="${b.balance ?? ""}" required data-util-input></label>
+        <label class="field">Credit limit<input name="credit_limit" type="number" step="0.01" min="0" inputmode="decimal" value="${b.credit_limit ?? ""}" required data-util-input></label>
+        <p class="util-preview full" data-util-preview>${utilPreview(b.credit_limit, b.balance)}</p>
+      </div>`,
+    actions: `<button type="button" class="btn" data-close>Cancel</button><button class="btn primary" value="save">Save balance</button>`,
+    onSubmit: async (fd) => {
+      await api(`/api/bills/${b.id}/balance`, { method: "PUT", body: { balance: fd.get("balance"), credit_limit: fd.get("credit_limit") } });
+      toast("Balance saved");
+      route();
+    },
+  });
+}
+
 function openBillDetail(billId, due) {
   const all = [...(state.lastPeriod?.bills || []), ...(state.lastPeriod?.overdue || [])];
   const b = all.find((x) => x.id === billId && x.due_date === due);
@@ -380,9 +477,12 @@ function openBillDetail(billId, due) {
     body: `<p class="muted" style="margin-top:0">${b.description ? esc(b.description) + " · " : ""}Due ${dFull(b.due_date)}${b.account_hint ? ` · ••${esc(b.account_hint)}` : ""}</p>
       ${b.website ? `<p><a class="btn" href="${esc(b.website)}" target="_blank" rel="noopener noreferrer">Open payment site</a></p>` : ""}
       ${b.notes ? `<p style="white-space:pre-wrap">${esc(b.notes)}</p>` : ""}
+      ${utilBlock(b)}
       <div class="form-grid">
         <label class="field">Amount paid<input name="amount" type="number" step="0.01" min="0" inputmode="decimal" value="${paid ? b.payment.amount : b.amount}"></label>
         <label class="field">Paid on<input name="paid_on" type="date" value="${paid ? b.payment.paid_on : todayIso()}"></label>
+        ${b.is_credit_card ? `<label class="field full">Balance after this payment<input name="balance" type="number" step="0.01" min="0" inputmode="decimal" placeholder="${b.balance != null ? `Currently ${money(b.balance)}` : "Optional"}">
+          <span class="hint">Leave blank to keep the current balance</span></label>` : ""}
       </div>`,
     actions: `<button class="btn" value="edit" formnovalidate>Edit bill</button><span class="spacer"></span>
       ${paid ? '<button class="btn danger" value="unpay">Mark unpaid</button>' : ""}
@@ -397,7 +497,7 @@ function openBillDetail(billId, due) {
         await api("/api/payments", { method: "DELETE", body: { bill_id: b.id, due_date: b.due_date } });
         toast("Marked unpaid");
       } else {
-        await api("/api/payments", { method: "POST", body: { bill_id: b.id, due_date: b.due_date, amount: fd.get("amount"), paid_on: fd.get("paid_on") } });
+        await api("/api/payments", { method: "POST", body: { bill_id: b.id, due_date: b.due_date, amount: fd.get("amount"), paid_on: fd.get("paid_on"), balance: fd.get("balance") || "" } });
         toast("Marked paid");
       }
       route();
@@ -517,6 +617,13 @@ async function renderSettings() {
     </section>
 
     <section class="panel settings-panel">
+      <h2>Bill categories</h2>
+      <p>Bills in a credit card category get a balance, a credit limit and a 30% utilization marker.</p>
+      <ul class="user-list" id="category-list"><li class="muted">Loading…</li></ul>
+      <button class="btn" data-add-category>Add category</button>
+    </section>
+
+    <section class="panel settings-panel">
       <h2>Household accounts</h2>
       <p>Everyone listed here sees and edits the same bills and income.</p>
       <ul class="user-list" id="user-list"><li class="muted">Loading…</li></ul>
@@ -551,6 +658,54 @@ async function renderSettings() {
     } catch (ex) { err.textContent = ex.message; }
   });
   loadUsers();
+  renderCategoryList();
+}
+
+async function renderCategoryList() {
+  const cats = await loadCategories();
+  $("#category-list").innerHTML = cats.length ? cats.map((c) => `
+    <li><div><strong>${esc(c.name)}</strong>
+      <div class="muted">${c.kind === "credit_card" ? "Credit card" : "Standard"} · ${c.bill_count} bill${c.bill_count === 1 ? "" : "s"}</div></div>
+      <div style="display:flex;gap:6px">
+        <button class="btn small" data-edit-category="${c.id}">Edit</button>
+        <button class="btn small danger" data-delete-category="${c.id}">Delete</button>
+      </div></li>`).join("")
+    : `<li class="muted">No categories yet.</li>`;
+}
+
+function openCategory(c) {
+  const isEdit = !!c;
+  openModal({
+    title: isEdit ? "Edit category" : "Add category",
+    body: `<div class="form-grid">
+      <label class="field full">Name<input name="name" required maxlength="40" value="${esc(c?.name)}" placeholder="e.g. Car"></label>
+      <label class="field full">Type
+        <select name="kind">
+          <option value="standard" ${c?.kind !== "credit_card" ? "selected" : ""}>Standard</option>
+          <option value="credit_card" ${c?.kind === "credit_card" ? "selected" : ""}>Credit card</option>
+        </select>
+        <span class="hint">Credit card categories track balance, limit and 30% utilization</span></label>
+    </div>`,
+    actions: `<button type="button" class="btn" data-close>Cancel</button><button class="btn primary" value="save">${isEdit ? "Save changes" : "Add category"}</button>`,
+    onSubmit: async (fd) => {
+      const body = Object.fromEntries(fd.entries());
+      await api(isEdit ? `/api/categories/${c.id}` : "/api/categories", { method: isEdit ? "PUT" : "POST", body });
+      toast(isEdit ? "Category saved" : "Category added");
+      renderCategoryList();
+    },
+  });
+}
+
+async function deleteCategory(c) {
+  const msg = c.bill_count
+    ? `Delete "${c.name}"? Its ${c.bill_count} bill${c.bill_count === 1 ? "" : "s"} will be kept with no category.`
+    : `Delete "${c.name}"?`;
+  if (!confirm(msg)) return;
+  try {
+    await api(`/api/categories/${c.id}`, { method: "DELETE" });
+    toast("Category deleted");
+    renderCategoryList();
+  } catch (ex) { toast(ex.message); }
 }
 
 async function loadUsers() {
@@ -585,6 +740,13 @@ function openAddUser() {
 document.addEventListener("click", async (e) => {
   if (e.target.closest("[data-signout]")) { signOut(); return; }
   if (e.target.closest("[data-add-user]")) { openAddUser(); return; }
+  if (e.target.closest("[data-add-category]")) { openCategory(); return; }
+  const ec = e.target.closest("[data-edit-category]");
+  if (ec) { openCategory(categoryById(ec.dataset.editCategory)); return; }
+  const dc = e.target.closest("[data-delete-category]");
+  if (dc) { deleteCategory(categoryById(dc.dataset.deleteCategory)); return; }
+  const bb = e.target.closest("[data-balance-bill]");
+  if (bb) { openUpdateBalance(state.billsCache.find((b) => b.id === +bb.dataset.balanceBill)); return; }
   const ru = e.target.closest("[data-remove-user]");
   if (ru) {
     if (!confirm(`Remove ${ru.dataset.name}'s account? Your bills and income stay as they are.`)) return;
@@ -606,6 +768,21 @@ document.addEventListener("click", async (e) => {
     openIncome();
   } else if (t.dataset.editIncome) openIncome(state.incomeCache.find((i) => i.id === +t.dataset.editIncome));
   else if (t.dataset.filter) { state.billFilter = t.dataset.filter; renderBills(); }
+});
+
+// Show card fields when a credit card category is picked; live 30% preview while typing.
+document.addEventListener("input", (e) => {
+  if (e.target.matches("[data-util-input]")) {
+    const form = e.target.form;
+    const prev = form.querySelector("[data-util-preview]");
+    if (prev) prev.innerHTML = utilPreview(form.credit_limit?.value, form.balance?.value);
+  }
+});
+document.addEventListener("change", (e) => {
+  if (e.target.matches("[data-category-select]")) {
+    const box = e.target.form.querySelector("[data-cc-fields]");
+    if (box) box.hidden = categoryById(e.target.value)?.kind !== "credit_card";
+  }
 });
 
 document.addEventListener("change", async (e) => {
