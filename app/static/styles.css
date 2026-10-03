@@ -245,6 +245,24 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--primary); o
 .bill-row .mobile-actions { display: none; grid-column: 1 / -1; gap: 8px; }
 .bill-row .mobile-actions .btn { flex: 1; justify-content: center; }
 
+/* ---------- credit card utilization ---------- */
+.util { margin-top: 8px; font-size: .85rem; }
+.util-empty { color: var(--muted); }
+.util-meter { position: relative; height: 8px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--line); overflow: visible; max-width: 320px; }
+.util-meter .fill { position: absolute; inset: 0 auto 0 0; border-radius: inherit; background: var(--paid); }
+.util.is-over .util-meter .fill { background: var(--late); }
+.util-meter .mark { position: absolute; left: 30%; top: -4px; bottom: -4px; width: 2px; background: var(--ink); border-radius: 1px; }
+.util-text { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; margin-top: 6px; }
+.modal-util .util, #modal-body > .util { margin: 0 0 16px; }
+.cc-fields { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px 14px; margin: 0; min-width: 0; }
+.cc-fields[hidden] { display: none; }
+.cc-fields legend { font-weight: 700; font-size: .9rem; padding: 0 6px; }
+.util-preview { margin: 0; font-size: .88rem; color: var(--muted); }
+.util-preview strong { color: var(--ink); }
+.cc-summary { margin: -8px 0 16px; color: var(--muted); }
+.creditor-cell .util { max-width: 340px; }
+td[data-hide-mobile] { white-space: nowrap; }
+
 /* ---------- auth ---------- */
 #auth { min-height: 100vh; display: grid; place-items: center; padding: 24px 16px calc(24px + env(safe-area-inset-bottom, 0px)); }
 #auth[hidden], .shell[hidden] { display: none; }
