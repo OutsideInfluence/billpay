@@ -1,0 +1,70 @@
+# BillPay for Unraid (Compose Manager Plus)
+#
+# Before the first Compose Up, create these three empty folders
+# (over the network share is fine):
+#   /mnt/user/appdata/billpay/data    app database
+#   /mnt/user/appdata/billpay/caddy   HTTPS certificates
+#   /mnt/user/appdata/billpay/ca      put your ACME server's root certificate here as root.crt
+#
+# Then replace every value marked CHANGE below.
+
+services:
+  billpay:
+    image: ghcr.io/CHANGE-github-username/billpay:latest   # CHANGE (lowercase)
+    pull_policy: always            # every Compose Up fetches the newest build
+    container_name: billpay
+    restart: unless-stopped
+    user: "99:100"                 # Unraid's nobody:users
+    environment:
+      TZ: America/Chicago          # CHANGE if needed
+      COOKIE_SECURE: "1"           # login cookie only sent over HTTPS
+      TRUST_PROXY: "1"             # see real client IPs through the HTTPS proxy
+    volumes:
+      - type: bind
+        source: /mnt/user/appdata/billpay/data
+        target: /data
+    networks:
+      - backend                    # private; only the HTTPS proxy can reach it
+
+  https:
+    image: caddy:2
+    container_name: billpay-https
+    restart: unless-stopped
+    depends_on:
+      - billpay
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    volumes:
+      - type: bind
+        source: /mnt/user/appdata/billpay/caddy
+        target: /data
+      - type: bind
+        source: /mnt/user/appdata/billpay/ca
+        target: /ca
+        read_only: true
+    networks:
+      backend: {}
+      br2:                         # CHANGE if your Unraid custom network has another name
+        ipv4_address: 192.168.1.50 # CHANGE to a free address on your LAN
+
+networks:
+  backend:
+    internal: true
+  br2:
+    external: true
+
+configs:
+  caddyfile:
+    content: |
+      {
+        email you@example.com                                   # CHANGE
+        acme_ca https://acme.example.lan/acme/acme/directory    # CHANGE: your ACME directory URL
+        acme_ca_root /ca/root.crt                               # remove if your ACME server uses a public certificate
+      }
+
+      billpay.example.lan {                                     # CHANGE: the name you'll type in the browser
+        encode gzip
+        header Strict-Transport-Security "max-age=31536000"
+        reverse_proxy billpay:8080
+      }
