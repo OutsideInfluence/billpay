@@ -57,13 +57,14 @@ networks:
 configs:
   caddyfile:
     content: |
-      {
-        email you@example.com                                   # CHANGE
-        acme_ca https://acme.example.lan/acme/acme/directory    # CHANGE: your ACME directory URL
-        acme_ca_root /ca/root.crt                               # remove if your ACME server uses a public certificate
-      }
-
-      billpay.example.lan {                                     # CHANGE: the name you'll type in the browser
+      billpay.example.lan {                                       # CHANGE: the name you'll type in the browser
+        tls {
+          issuer acme {
+            dir https://acme.example.lan/acme/acme/directory      # CHANGE: your ACME directory URL
+            email you@example.com                                 # CHANGE
+            trusted_roots /ca/root.crt                            # remove if your ACME server uses a public certificate
+          }
+        }
         encode gzip
         header Strict-Transport-Security "max-age=31536000"
         reverse_proxy billpay:8080
