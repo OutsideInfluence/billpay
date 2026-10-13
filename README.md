@@ -39,6 +39,17 @@ which builds a new image. Compose Up on Unraid pulls it.
   a checklist to mark bills paid, and a list of anything still unpaid from the
   previous 60 days. Use ‹ › to look ahead or back.
 
+## Portainer
+
+`deploy/portainer/docker-compose.yml` is a self-contained stack for Portainer on
+any Linux Docker host. Paste it into **Stacks → Add stack → Web editor**, paste the
+values from `deploy/portainer/stack.env` into the stack's environment variables
+(Advanced mode), and paste your ACME root certificate into `CA_ROOT_PEM`.
+The stack creates its own macvlan network (so the site gets its own IP), its
+volumes, and its HTTPS settings. Nothing has to be copied to the server.
+
+Volumes are named `<stack-name>_billpay-data`, `_caddy-data` and `_caddy-config`.
+
 ## Credit cards and categories
 
 Manage categories under **Settings → Bill categories**. A category is either
@@ -58,6 +69,19 @@ or under 30% of its own limit (with a per-card breakdown).
 Deleting a category keeps its bills; they're just left without a category.
 Upgrading from an earlier version converts existing free-text categories
 automatically. Any category with "credit" in its name becomes a credit card category.
+
+## Activity log
+
+Every change is recorded on the **Activity** page: payments (marked paid,
+changed, unmarked), balance and credit-limit updates, bills added/edited/deleted,
+paychecks, categories, settings, accounts, password changes, and sign-ins
+(including failed and blocked attempts, with the IP address).
+
+- Each entry shows who did it and when; edits show old → new values.
+- Filter by type or person, search, and download as CSV.
+- A bill's **Details** window shows its recent history.
+- The log is append-only. The app has no way to edit or delete entries, and
+  passwords are never recorded.
 
 ## Data & backups
 
