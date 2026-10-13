@@ -1,12 +1,15 @@
 """BillPay - household bill tracker. Flask + SQLite."""
 import calendar
+import csv
+import io
+import json
 import os
 import re
 import secrets
 import sqlite3
 from datetime import date, datetime, timedelta
 
-from flask import Flask, g, jsonify, request, send_from_directory, session
+from flask import Flask, Response, g, jsonify, request, send_from_directory, session
 from werkzeug.security import check_password_hash, generate_password_hash
 
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "billpay.db"))
@@ -90,6 +93,20 @@ CREATE TABLE IF NOT EXISTS login_failures (
 );
 CREATE INDEX IF NOT EXISTS idx_fail_user ON login_failures(username, at);
 CREATE INDEX IF NOT EXISTS idx_fail_ip ON login_failures(ip, at);
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,                 -- UTC, ISO 8601
+    user_id INTEGER,                  -- no foreign key: entries outlive deleted accounts
+    username TEXT,
+    action TEXT NOT NULL,             -- e.g. payment.paid, balance.update, bill.update
+    entity_type TEXT,
+    entity_id INTEGER,
+    summary TEXT NOT NULL,
+    details TEXT,                     -- JSON: {"changes":[{field,from,to}]} or {"fields":[{field,value}]}
+    ip TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
+CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity_type, entity_id);
 CREATE TABLE IF NOT EXISTS categories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -273,6 +290,8 @@ def auth_setup():
             "INSERT INTO users (username, display_name, password_hash, created_at) VALUES (?,?,?,?)",
             (username, name, generate_password_hash(password), datetime.utcnow().isoformat()),
         )
+        audit("auth.setup", f"Created the first account: {username}", "user", cur.lastrowid,
+              user={"id": cur.lastrowid, "username": username})
         db().commit()
     except sqlite3.IntegrityError:
         return bad("Setup is already complete. Sign in instead.", 409)
@@ -292,6 +311,8 @@ def auth_login():
     fails_user = conn.execute("SELECT COUNT(*) FROM login_failures WHERE username=? AND at>=?", (username, since)).fetchone()[0]
     fails_ip = conn.execute("SELECT COUNT(*) FROM login_failures WHERE ip=? AND at>=?", (ip, since)).fetchone()[0]
     if fails_user >= MAX_FAILS or fails_ip >= MAX_FAILS * 3:
+        audit("auth.blocked", f"Sign-in blocked after too many attempts for \"{username}\"",
+              user=False, username=username or None)
         conn.commit()
         return bad(f"Too many failed attempts. Try again in {LOCK_MINUTES} minutes.", 429)
 
@@ -300,9 +321,11 @@ def auth_login():
     ok = check_password_hash(row["password_hash"] if row else _DUMMY_HASH, password) and row is not None
     if not ok:
         conn.execute("INSERT INTO login_failures (username, ip, at) VALUES (?,?,?)", (username, ip, datetime.utcnow().isoformat()))
+        audit("auth.failed", f"Failed sign-in for \"{username}\"", user=False, username=username or None)
         conn.commit()
         return bad("That username and password don't match.", 401)
     conn.execute("DELETE FROM login_failures WHERE username=?", (username,))
+    audit("auth.signin", "Signed in", "user", row["id"], user={"id": row["id"], "username": row["username"]})
     conn.commit()
     start_session(row, data.get("remember", True))
     return jsonify({"user": current_user()})
@@ -313,6 +336,9 @@ _DUMMY_HASH = generate_password_hash(secrets.token_hex(16))
 
 @app.post("/api/auth/logout")
 def auth_logout():
+    if current_user():
+        audit("auth.signout", "Signed out", "user", current_user()["id"])
+        db().commit()
     session.clear()
     return jsonify({"ok": True})
 
@@ -332,10 +358,11 @@ def users_create():
         return bad(str(e))
     name = (data.get("display_name") or username).strip()[:60]
     try:
-        db().execute(
+        cur = db().execute(
             "INSERT INTO users (username, display_name, password_hash, created_at) VALUES (?,?,?,?)",
             (username, name, generate_password_hash(password), datetime.utcnow().isoformat()),
         )
+        audit("user.create", f"Added account {username} ({name})", "user", cur.lastrowid)
         db().commit()
     except sqlite3.IntegrityError:
         return bad("That username is already taken.")
@@ -348,7 +375,10 @@ def users_delete(uid):
         return bad("You can't remove your own account while signed in to it.")
     if user_count() <= 1:
         return bad("At least one account must remain.")
+    gone = db().execute("SELECT username, display_name FROM users WHERE id=?", (uid,)).fetchone()
     db().execute("DELETE FROM users WHERE id=?", (uid,))
+    if gone:
+        audit("user.delete", f"Removed account {gone['username']} ({gone['display_name']})", "user", uid)
     db().commit()
     return "", 204
 
@@ -358,8 +388,11 @@ def users_update_me():
     data = request.get_json(force=True) or {}
     me = current_user()
     row = db().execute("SELECT * FROM users WHERE id=?", (me["id"],)).fetchone()
-    if "display_name" in data and str(data["display_name"]).strip():
-        db().execute("UPDATE users SET display_name=? WHERE id=?", (str(data["display_name"]).strip()[:60], me["id"]))
+    new_name = str(data.get("display_name", "")).strip()[:60]
+    if new_name and new_name != row["display_name"]:
+        db().execute("UPDATE users SET display_name=? WHERE id=?", (new_name, me["id"]))
+        audit("user.update", f"Changed display name to {new_name}", "user", me["id"],
+              {"changes": [{"field": "Name", "from": row["display_name"], "to": new_name}]})
     if data.get("new_password"):
         if not check_password_hash(row["password_hash"], str(data.get("current_password", ""))):
             return bad("Your current password is incorrect.")
@@ -371,12 +404,136 @@ def users_update_me():
             "UPDATE users SET password_hash=?, session_version=session_version+1 WHERE id=?",
             (generate_password_hash(pw), me["id"]),
         )
+        audit("user.password", "Changed password (other devices signed out)", "user", me["id"])
         db().commit()
         # Keep this device signed in; every other device is signed out.
         start_session(db().execute("SELECT * FROM users WHERE id=?", (me["id"],)).fetchone(), session.permanent)
     db().commit()
     g.pop("user", None)
     return jsonify({"user": current_user()})
+
+
+# ---------- audit log ----------
+AUDIT_GROUPS = {
+    "payments": ["payment.%"],
+    "balances": ["balance.%"],
+    "bills": ["bill.%"],
+    "income": ["income.%"],
+    "categories": ["category.%"],
+    "settings": ["settings.%"],
+    "accounts": ["user.%", "auth.%"],
+}
+
+
+def audit(action, summary, entity_type=None, entity_id=None, details=None, user=None, username=None):
+    """Record one entry. Call before commit so it's saved in the same transaction as the change."""
+    u = user if user is not None else current_user()
+    db().execute(
+        "INSERT INTO audit_log (at, user_id, username, action, entity_type, entity_id, summary, details, ip) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            u["id"] if u else None,
+            username or (u["username"] if u else None),
+            action, entity_type, entity_id, summary,
+            json.dumps(details) if details else None,
+            client_ip(),
+        ),
+    )
+
+
+def fmt_money(v):
+    return "—" if v is None or v == "" else f"${float(v):,.2f}"
+
+
+def fmt_date(v):
+    if not v:
+        return "—"
+    try:
+        d = datetime.strptime(str(v)[:10], "%Y-%m-%d").date()
+        return f"{d.strftime('%b')} {d.day}, {d.year}"
+    except ValueError:
+        return str(v)
+
+
+def ordinal(n):
+    n = int(n)
+    suffix = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def category_name(cid):
+    if not cid:
+        return "No category"
+    r = db().execute("SELECT name FROM categories WHERE id=?", (cid,)).fetchone()
+    return r["name"] if r else "Deleted category"
+
+
+# Bill fields as they appear in the log: (label, formatter)
+BILL_FIELD_LABELS = {
+    "creditor": ("Creditor", str),
+    "description": ("Description", lambda v: v or "—"),
+    "amount": ("Amount", fmt_money),
+    "due_day": ("Due day", lambda v: f"the {ordinal(v)}"),
+    "website": ("Payment website", lambda v: v or "—"),
+    "category_id": ("Category", category_name),
+    "account_hint": ("Account (last 4)", lambda v: f"••{v}" if v else "—"),
+    "autopay": ("Paid automatically", lambda v: "Yes" if v else "No"),
+    "notes": ("Notes", lambda v: (v or "—")[:300]),
+    "active": ("Active", lambda v: "Yes" if v else "No"),
+    "start_date": ("First due month", lambda v: datetime.strptime(v[:7], "%Y-%m").strftime("%B %Y") if v else "—"),
+    "credit_limit": ("Credit limit", fmt_money),
+    "balance": ("Balance", fmt_money),
+}
+BALANCE_FIELDS = ("balance", "credit_limit")
+
+
+def norm(v):
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, float) and v.is_integer():
+        return v
+    return v if v not in ("",) else None
+
+
+def diff_fields(old, new, labels):
+    """List of {field, from, to} for keys in new whose value differs from old."""
+    out = []
+    for k, v in new.items():
+        if k not in labels:
+            continue
+        before = old.get(k)
+        if norm(before) == norm(v) or (before in (None, "") and v in (None, "")):
+            continue
+        label, f = labels[k]
+        out.append({"field": label, "from": f(before) if before not in (None,) else "—", "to": f(v) if v is not None else "—"})
+    return out
+
+
+def snapshot(obj, labels):
+    return [{"field": labels[k][0], "value": labels[k][1](obj.get(k)) if obj.get(k) is not None else "—"}
+            for k in labels if k in obj]
+
+
+def audit_bill_changes(old, new):
+    """Split a bill edit into a balance/limit entry and a general edit entry."""
+    bal_new = {k: v for k, v in new.items() if k in BALANCE_FIELDS}
+    gen_new = {k: v for k, v in new.items() if k not in BALANCE_FIELDS}
+    name = new.get("creditor") or old["creditor"]
+    bal = diff_fields(old, bal_new, BILL_FIELD_LABELS)
+    if bal:
+        audit("balance.update", balance_summary(name, bal), "bill", old["id"], {"changes": bal})
+    gen = diff_fields(old, gen_new, BILL_FIELD_LABELS)
+    if gen:
+        audit("bill.update", f"Edited {name}: " + ", ".join(c["field"].lower() for c in gen),
+              "bill", old["id"], {"changes": gen})
+
+
+def balance_summary(name, changes):
+    if len(changes) == 1:
+        c = changes[0]
+        return f"{name} {c['field'].lower()} {c['from']} → {c['to']}"
+    return f"Updated {name} " + " and ".join(c["field"].lower() for c in changes)
 
 
 # ---------- helpers ----------
@@ -487,6 +644,13 @@ def settings_get():
     return jsonify(get_settings())
 
 
+SETTING_LABELS = {
+    "person1": ("First person", str), "person2": ("Second person", str),
+    "pay_schedule": ("Pay schedule", lambda v: {"biweekly": "Every 2 weeks", "semimonthly": "1st and 15th"}.get(v, v)),
+    "payday_anchor": ("Reference payday", fmt_date),
+}
+
+
 @app.put("/api/settings")
 def settings_put():
     data = request.get_json(force=True) or {}
@@ -498,9 +662,14 @@ def settings_put():
             parse_date(data["payday_anchor"])
         except ValueError:
             return bad("Payday must be a valid date.")
-    for k, v in data.items():
-        if k in allowed:
-            db().execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (k, str(v).strip()))
+    before = get_settings()
+    new = {k: str(v).strip() for k, v in data.items() if k in allowed}
+    for k, v in new.items():
+        db().execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (k, v))
+    changes = diff_fields(before, new, SETTING_LABELS)
+    if changes:
+        audit("settings.update", "Changed settings: " + ", ".join(c["field"].lower() for c in changes),
+              details={"changes": changes})
     db().commit()
     return jsonify(get_settings())
 
@@ -589,6 +758,8 @@ def bills_create():
         return bad(str(e))
     cols = ",".join(b)
     cur = db().execute(f"INSERT INTO bills ({cols}) VALUES ({','.join('?' * len(b))})", list(b.values()))
+    audit("bill.create", f"Added bill {b['creditor']} ({fmt_money(b['amount'])}, due the {ordinal(b['due_day'])})",
+          "bill", cur.lastrowid, {"fields": snapshot(b, BILL_FIELD_LABELS)})
     db().commit()
     return jsonify(get_bill(cur.lastrowid)), 201
 
@@ -610,6 +781,7 @@ def bills_update(bid):
     if b:
         sets = ",".join(f"{k}=?" for k in b)
         db().execute(f"UPDATE bills SET {sets} WHERE id=?", [*b.values(), bid])
+        audit_bill_changes(old, b)
         db().commit()
     return jsonify(get_bill(bid))
 
@@ -618,7 +790,8 @@ def bills_update(bid):
 def bills_set_balance(bid):
     """Quick update of a credit card's balance and/or limit."""
     data = request.get_json(force=True) or {}
-    if not get_bill(bid):
+    old = get_bill(bid)
+    if not old:
         return bad("Bill not found.", 404)
     try:
         updates = {}
@@ -631,9 +804,13 @@ def bills_set_balance(bid):
                 raise ValueError("Credit limit must be more than zero.")
     except ValueError as e:
         return bad(str(e))
+    if "balance" in updates and updates["balance"] == old.get("balance"):
+        updates.pop("balance")
+        updates.pop("balance_updated", None)
     if updates:
         sets = ",".join(f"{k}=?" for k in updates)
         db().execute(f"UPDATE bills SET {sets} WHERE id=?", [*updates.values(), bid])
+        audit_bill_changes(old, updates)
         db().commit()
     return jsonify(get_bill(bid))
 
@@ -649,6 +826,9 @@ def clean_category(data):
     return name, kind
 
 
+CATEGORY_LABELS = {"name": ("Name", str), "kind": ("Type", lambda v: "Credit card" if v == "credit_card" else "Standard")}
+
+
 @app.get("/api/categories")
 def categories_list():
     return jsonify(rows(db().execute("""
@@ -662,6 +842,7 @@ def categories_create():
     try:
         name, kind = clean_category(request.get_json(force=True) or {})
         cur = db().execute("INSERT INTO categories (name, kind) VALUES (?, ?)", (name, kind))
+        audit("category.create", f"Added category {name} ({CATEGORY_LABELS['kind'][1](kind)})", "category", cur.lastrowid)
         db().commit()
     except ValueError as e:
         return bad(str(e))
@@ -674,7 +855,14 @@ def categories_create():
 def categories_update(cid):
     try:
         name, kind = clean_category(request.get_json(force=True) or {})
+        old = db().execute("SELECT name, kind FROM categories WHERE id=?", (cid,)).fetchone()
+        if not old:
+            return bad("Category not found.", 404)
         db().execute("UPDATE categories SET name=?, kind=? WHERE id=?", (name, kind, cid))
+        changes = diff_fields(dict(old), {"name": name, "kind": kind}, CATEGORY_LABELS)
+        if changes:
+            audit("category.update", f"Edited category {name}: " + ", ".join(c["field"].lower() for c in changes),
+                  "category", cid, {"changes": changes})
         db().commit()
     except ValueError as e:
         return bad(str(e))
@@ -686,15 +874,26 @@ def categories_update(cid):
 @app.delete("/api/categories/<int:cid>")
 def categories_delete(cid):
     # Bills in this category stay, with no category. Their balance and limit are kept.
-    db().execute("UPDATE bills SET category_id = NULL WHERE category_id = ?", (cid,))
+    old = db().execute("SELECT name FROM categories WHERE id=?", (cid,)).fetchone()
+    if not old:
+        return "", 204
+    moved = db().execute("UPDATE bills SET category_id = NULL WHERE category_id = ?", (cid,)).rowcount
     db().execute("DELETE FROM categories WHERE id = ?", (cid,))
+    audit("category.delete", f"Deleted category {old['name']}" + (f"; {moved} bill{'s' if moved != 1 else ''} left without a category" if moved else ""),
+          "category", cid)
     db().commit()
     return "", 204
 
 
 @app.delete("/api/bills/<int:bid>")
 def bills_delete(bid):
+    old = get_bill(bid)
+    if not old:
+        return "", 204
+    paid = db().execute("SELECT COUNT(*) FROM payments WHERE bill_id=?", (bid,)).fetchone()[0]
     db().execute("DELETE FROM bills WHERE id=?", (bid,))
+    audit("bill.delete", f"Deleted bill {old['creditor']}" + (f" and its {paid} payment record{'s' if paid != 1 else ''}" if paid else ""),
+          "bill", bid, {"fields": snapshot(old, BILL_FIELD_LABELS)})
     db().commit()
     return "", 204
 
@@ -725,6 +924,12 @@ def clean_income(data):
     return earner, amount, d.isoformat(), str(data.get("note", "")).strip()
 
 
+INCOME_LABELS = {
+    "earner": ("Who", str), "amount": ("Amount", fmt_money),
+    "deposit_date": ("Deposit date", fmt_date), "note": ("Note", lambda v: v or "—"),
+}
+
+
 @app.post("/api/income")
 def income_create():
     try:
@@ -732,6 +937,7 @@ def income_create():
     except ValueError as e:
         return bad(str(e))
     cur = db().execute("INSERT INTO income (earner, amount, deposit_date, note) VALUES (?,?,?,?)", vals)
+    audit("income.create", f"Added paycheck: {vals[0]} {fmt_money(vals[1])} on {fmt_date(vals[2])}", "income", cur.lastrowid)
     db().commit()
     return jsonify(dict(db().execute("SELECT * FROM income WHERE id=?", (cur.lastrowid,)).fetchone())), 201
 
@@ -742,15 +948,25 @@ def income_update(iid):
         vals = clean_income(request.get_json(force=True) or {})
     except ValueError as e:
         return bad(str(e))
+    old = db().execute("SELECT * FROM income WHERE id=?", (iid,)).fetchone()
+    if not old:
+        return bad("Paycheck not found.", 404)
     db().execute("UPDATE income SET earner=?, amount=?, deposit_date=?, note=? WHERE id=?", (*vals, iid))
+    changes = diff_fields(dict(old), dict(zip(("earner", "amount", "deposit_date", "note"), vals)), INCOME_LABELS)
+    if changes:
+        audit("income.update", f"Edited paycheck ({vals[0]}, {fmt_date(vals[2])}): " + ", ".join(c["field"].lower() for c in changes),
+              "income", iid, {"changes": changes})
     db().commit()
     return jsonify(dict(db().execute("SELECT * FROM income WHERE id=?", (iid,)).fetchone()))
 
 
 @app.delete("/api/income/<int:iid>")
 def income_delete(iid):
-    db().execute("DELETE FROM income WHERE id=?", (iid,))
-    db().commit()
+    old = db().execute("SELECT * FROM income WHERE id=?", (iid,)).fetchone()
+    if old:
+        db().execute("DELETE FROM income WHERE id=?", (iid,))
+        audit("income.delete", f"Deleted paycheck: {old['earner']} {fmt_money(old['amount'])} on {fmt_date(old['deposit_date'])}", "income", iid)
+        db().commit()
     return "", 204
 
 
@@ -763,20 +979,36 @@ def payments_create():
         paid_on = parse_date(data.get("paid_on"), date.today()).isoformat()
     except (KeyError, TypeError, ValueError):
         return bad("A bill and due date are required.")
-    bill = db().execute("SELECT amount FROM bills WHERE id=?", (bill_id,)).fetchone()
+    bill = get_bill(bill_id)
     if not bill:
         return bad("Bill not found.", 404)
-    amount = round(float(data.get("amount", bill["amount"])), 2)
+    try:
+        amount = money_or_none(data.get("amount"), "Amount paid")
+        bal = money_or_none(data.get("balance"), "Balance")
+    except ValueError as e:
+        return bad(str(e))
+    if amount is None:
+        amount = bill["amount"]
+    prev = db().execute("SELECT * FROM payments WHERE bill_id=? AND due_date=?", (bill_id, due)).fetchone()
     db().execute(
         "INSERT OR REPLACE INTO payments (bill_id, due_date, paid_on, amount) VALUES (?,?,?,?)",
         (bill_id, due, paid_on, amount),
     )
-    if str(data.get("balance", "")).strip() != "":
-        try:
-            bal = money_or_none(data["balance"], "Balance")
-        except ValueError as e:
-            return bad(str(e))
+    name = bill["creditor"]
+    if prev:
+        changes = diff_fields(dict(prev), {"amount": amount, "paid_on": paid_on},
+                              {"amount": ("Amount paid", fmt_money), "paid_on": ("Paid on", fmt_date)})
+        if changes:
+            audit("payment.update", f"Changed {name} payment for the {fmt_date(due)} due date", "bill", bill_id,
+                  {"changes": changes})
+    else:
+        audit("payment.paid", f"Marked {name} paid: {fmt_money(amount)} on {fmt_date(paid_on)} (due {fmt_date(due)})",
+              "bill", bill_id, {"fields": [{"field": "Amount paid", "value": fmt_money(amount)},
+                                           {"field": "Paid on", "value": fmt_date(paid_on)},
+                                           {"field": "Due date", "value": fmt_date(due)}]})
+    if bal is not None and bal != bill.get("balance"):
         db().execute("UPDATE bills SET balance=?, balance_updated=? WHERE id=?", (bal, date.today().isoformat(), bill_id))
+        audit_bill_changes(bill, {"balance": bal})
     db().commit()
     return jsonify({"ok": True}), 201
 
@@ -784,9 +1016,80 @@ def payments_create():
 @app.delete("/api/payments")
 def payments_delete():
     data = request.get_json(force=True) or {}
-    db().execute("DELETE FROM payments WHERE bill_id=? AND due_date=?", (data.get("bill_id"), data.get("due_date")))
-    db().commit()
+    prev = db().execute("SELECT * FROM payments WHERE bill_id=? AND due_date=?",
+                        (data.get("bill_id"), data.get("due_date"))).fetchone()
+    if prev:
+        db().execute("DELETE FROM payments WHERE id=?", (prev["id"],))
+        bill = get_bill(prev["bill_id"])
+        audit("payment.unpaid", f"Marked {bill['creditor'] if bill else 'a bill'} unpaid (due {fmt_date(prev['due_date'])}); "
+              f"removed payment of {fmt_money(prev['amount'])}", "bill", prev["bill_id"])
+        db().commit()
     return "", 204
+
+
+def audit_query(args):
+    where, params = [], []
+    group = args.get("group")
+    if group in AUDIT_GROUPS:
+        where.append("(" + " OR ".join("action LIKE ?" for _ in AUDIT_GROUPS[group]) + ")")
+        params += AUDIT_GROUPS[group]
+    if args.get("user"):
+        where.append("username = ?")
+        params.append(args["user"])
+    if args.get("q"):
+        where.append("(summary LIKE ? OR details LIKE ?)")
+        params += [f"%{args['q'][:100]}%"] * 2
+    if args.get("bill_id"):
+        where.append("entity_type = 'bill' AND entity_id = ?")
+        params.append(int(args["bill_id"]))
+    return (" WHERE " + " AND ".join(where)) if where else "", params
+
+
+def audit_row(r):
+    d = dict(r)
+    d["details"] = json.loads(d["details"]) if d["details"] else None
+    return d
+
+
+@app.get("/api/audit")
+def audit_list():
+    try:
+        limit = min(max(int(request.args.get("limit", 50)), 1), 200)
+        before = int(request.args["before"]) if request.args.get("before") else None
+    except ValueError:
+        return bad("Invalid paging values.")
+    where, params = audit_query(request.args)
+    if before:
+        where += (" AND " if where else " WHERE ") + "id < ?"
+        params.append(before)
+    items = [audit_row(r) for r in db().execute(
+        f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ?", (*params, limit + 1))]
+    more = len(items) > limit
+    items = items[:limit]
+    users = [r[0] for r in db().execute(
+        "SELECT DISTINCT username FROM audit_log WHERE username IS NOT NULL ORDER BY username")]
+    return jsonify({"entries": items, "next_before": items[-1]["id"] if more else None, "users": users})
+
+
+def csv_safe(v):
+    # Stop spreadsheet apps from treating a value as a formula.
+    v = "" if v is None else str(v)
+    return "'" + v if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
+
+
+@app.get("/api/audit/export.csv")
+def audit_export():
+    where, params = audit_query(request.args)
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["Time (UTC)", "Who", "Type", "Summary", "Details", "IP"])
+    for r in db().execute(f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT 100000", params):
+        det = json.loads(r["details"]) if r["details"] else {}
+        parts = [f"{c['field']}: {c['from']} -> {c['to']}" for c in det.get("changes", [])]
+        parts += [f"{c['field']}: {c['value']}" for c in det.get("fields", [])]
+        w.writerow([csv_safe(x) for x in (r["at"], r["username"] or "", r["action"], r["summary"], "; ".join(parts), r["ip"] or "")])
+    return Response(out.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename=billpay-activity-{date.today().isoformat()}.csv"})
 
 
 @app.get("/api/period")
