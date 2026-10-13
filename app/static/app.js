@@ -2,7 +2,7 @@
 
 const $ = (s, el = document) => el.querySelector(s);
 const view = $("#view");
-const state = { settings: null, periodDate: null, billFilter: "active", user: null };
+const state = { settings: null, periodDate: null, billFilter: "active", user: null, activity: { group: "", user: "", q: "" } };
 
 // ---------- utilities ----------
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -145,7 +145,7 @@ async function boot() {
 }
 
 // ---------- router ----------
-const routes = { "": renderDashboard, bills: renderBills, income: renderIncome, settings: renderSettings };
+const routes = { "": renderDashboard, bills: renderBills, income: renderIncome, activity: renderActivity, settings: renderSettings };
 async function route() {
   if (!state.user) return;
   const key = location.hash.replace(/^#\/?/, "").split("?")[0];
@@ -500,10 +500,22 @@ function openUpdateBalance(b) {
   });
 }
 
+async function loadBillHistory(billId) {
+  const box = $("#bill-history");
+  if (!box) return;
+  try {
+    const r = await api(`/api/audit?bill_id=${billId}&limit=6`);
+    box.innerHTML = r.entries.length
+      ? `<h3>Recent history</h3><ul class="act-list compact">${r.entries.map((e) => activityItem(e, { showDay: true })).join("")}</ul>`
+      : "";
+  } catch { box.innerHTML = ""; }
+}
+
 function openBillDetail(billId, due) {
   const all = [...(state.lastPeriod?.bills || []), ...(state.lastPeriod?.overdue || [])];
   const b = all.find((x) => x.id === billId && x.due_date === due);
   if (!b) return;
+  setTimeout(() => loadBillHistory(b.id), 0);
   const paid = !!b.payment;
   openModal({
     title: b.creditor,
@@ -516,7 +528,8 @@ function openBillDetail(billId, due) {
         <label class="field">Paid on<input name="paid_on" type="date" value="${paid ? b.payment.paid_on : todayIso()}"></label>
         ${b.is_credit_card ? `<label class="field full">Balance after this payment<input name="balance" type="number" step="0.01" min="0" inputmode="decimal" placeholder="${b.balance != null ? `Currently ${money(b.balance)}` : "Optional"}">
           <span class="hint">Leave blank to keep the current balance</span></label>` : ""}
-      </div>`,
+      </div>
+      <div id="bill-history" class="bill-history"></div>`,
     actions: `<button class="btn" value="edit" formnovalidate>Edit bill</button><span class="spacer"></span>
       ${paid ? '<button class="btn danger" value="unpay">Mark unpaid</button>' : ""}
       <button class="btn primary" value="pay">${paid ? "Update payment" : "Mark paid"}</button>`,
@@ -599,6 +612,101 @@ function openIncome(i) {
       route();
     },
   });
+}
+
+// ---------- activity (audit log) ----------
+const ACTIVITY_GROUPS = [
+  ["", "All activity"], ["payments", "Payments"], ["balances", "Balances & limits"], ["bills", "Bills"],
+  ["income", "Income"], ["categories", "Categories"], ["settings", "Settings"], ["accounts", "Accounts & sign-ins"],
+];
+const actionKind = (a) => a.split(".")[0];
+const KIND_LABEL = { payment: "Payment", balance: "Balance", bill: "Bill", income: "Income", category: "Category", settings: "Settings", user: "Account", auth: "Sign-in" };
+
+function activityDetails(e) {
+  const d = e.details;
+  if (!d) return "";
+  const rows = (d.changes || []).map((c) => `<tr><th>${esc(c.field)}</th><td class="from">${esc(c.from)}</td><td class="arrow" aria-hidden="true">→</td><td class="to">${esc(c.to)}</td></tr>`)
+    .concat((d.fields || []).map((c) => `<tr><th>${esc(c.field)}</th><td colspan="3">${esc(c.value)}</td></tr>`));
+  if (!rows.length) return "";
+  return `<details><summary>${d.changes ? "Show changes" : "Show details"}</summary>
+    <div class="table-wrap"><table class="changes">${rows.join("")}</table></div></details>`;
+}
+
+function activityItem(e, { showDay = false } = {}) {
+  const t = new Date(e.at);
+  const kind = actionKind(e.action);
+  const when = t.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  return `<li class="act-item act-${kind}${/failed|blocked/.test(e.action) ? " act-warn" : ""}">
+    <span class="act-dot" aria-hidden="true"></span>
+    <div class="act-body">
+      <div class="act-summary">${esc(e.summary)}</div>
+      <div class="act-meta">
+        <span class="tag">${KIND_LABEL[kind] || kind}</span>
+        <span>${showDay ? t.toLocaleDateString(undefined, { month: "short", day: "numeric" }) + ", " : ""}${when}</span>
+        <span>${e.username ? `by ${esc(e.username)}` : "unknown user"}</span>
+        ${/^auth\./.test(e.action) && e.ip ? `<span>from ${esc(e.ip)}</span>` : ""}
+      </div>
+      ${activityDetails(e)}
+    </div>
+  </li>`;
+}
+
+function activityQuery(extra = {}) {
+  const f = { ...state.activity, ...extra };
+  const p = new URLSearchParams();
+  if (f.group) p.set("group", f.group);
+  if (f.user) p.set("user", f.user);
+  if (f.q) p.set("q", f.q);
+  if (f.before) p.set("before", f.before);
+  if (f.limit) p.set("limit", f.limit);
+  return p.toString();
+}
+
+async function renderActivity() {
+  const f = state.activity;
+  view.innerHTML = `
+    <div class="page-head">
+      <div><h1>Activity</h1><p>Every payment, balance update and change, newest first.</p></div>
+      <a class="btn" id="act-export" href="/api/audit/export.csv?${activityQuery()}" download>Download CSV</a>
+    </div>
+    <div class="act-filters">
+      <label class="field">Show<select id="act-group">${ACTIVITY_GROUPS.map(([v, l]) => `<option value="${v}" ${v === f.group ? "selected" : ""}>${l}</option>`).join("")}</select></label>
+      <label class="field">Who<select id="act-user"><option value="">Everyone</option></select></label>
+      <label class="field act-search">Search<input id="act-q" type="search" value="${esc(f.q)}" placeholder="e.g. Visa, balance, 1,200"></label>
+    </div>
+    <div class="panel"><ul class="act-list" id="act-list"><li class="empty">Loading…</li></ul></div>
+    <p style="text-align:center;margin-top:16px"><button class="btn" id="act-more" hidden>Show older activity</button></p>`;
+
+  let next = null, lastDay = null;
+  const list = $("#act-list");
+  async function load(reset) {
+    if (reset) { next = null; lastDay = null; }
+    const r = await api(`/api/audit?${activityQuery({ before: reset ? null : next })}`);
+    if (reset) {
+      list.innerHTML = "";
+      const sel = $("#act-user");
+      sel.innerHTML = `<option value="">Everyone</option>` + r.users.map((u) => `<option ${u === f.user ? "selected" : ""}>${esc(u)}</option>`).join("");
+    }
+    if (reset && !r.entries.length) {
+      list.innerHTML = `<li class="empty">${f.group || f.user || f.q ? "Nothing matches these filters." : "No activity yet."}</li>`;
+    }
+    let html = "";
+    for (const e of r.entries) {
+      const day = new Date(e.at).toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" });
+      if (day !== lastDay) { html += `<li class="act-day">${day}</li>`; lastDay = day; }
+      html += activityItem(e);
+    }
+    list.insertAdjacentHTML("beforeend", html);
+    next = r.next_before;
+    $("#act-more").hidden = !next;
+    $("#act-export").href = `/api/audit/export.csv?${activityQuery()}`;
+  }
+  $("#act-group").onchange = (e) => { f.group = e.target.value; load(true); };
+  $("#act-user").onchange = (e) => { f.user = e.target.value; load(true); };
+  let timer;
+  $("#act-q").oninput = (e) => { clearTimeout(timer); timer = setTimeout(() => { f.q = e.target.value.trim(); load(true); }, 300); };
+  $("#act-more").onclick = () => load(false);
+  await load(true);
 }
 
 // ---------- settings ----------
